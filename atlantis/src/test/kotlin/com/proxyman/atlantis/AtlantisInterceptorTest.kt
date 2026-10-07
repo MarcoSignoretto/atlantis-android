@@ -256,4 +256,47 @@ class AtlantisInterceptorTest {
         threads.forEach { it.start() }
         threads.forEach { it.join() }
     }
+
+    @Test
+    fun `test interceptor does not buffer server-sent events stream`() {
+        val event = "data: tick\n\n"
+        mockWebServer.enqueue(MockResponse()
+            .setResponseCode(200)
+            .addHeader("Content-Type", "text/event-stream")
+            .setBody(event.repeat(3))
+            .throttleBody(event.length.toLong(), 1, TimeUnit.SECONDS))
+
+        val request = Request.Builder()
+            .url(mockWebServer.url("/api/events"))
+            .get()
+            .build()
+
+        val start = System.nanoTime()
+        val response = client.newCall(request).execute()
+        val firstLine = response.body!!.source().readUtf8Line()
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
+
+        assertEquals("data: tick", firstLine)
+        assertTrue("First event took ${elapsedMs}ms, stream was buffered", elapsedMs < 1000)
+        response.close()
+    }
+
+    @Test
+    fun `test interceptor preserves server-sent events body for consumer`() {
+        val expectedBody = "data: one\n\ndata: two\n\n"
+        mockWebServer.enqueue(MockResponse()
+            .setResponseCode(200)
+            .addHeader("Content-Type", "text/event-stream; charset=utf-8")
+            .setBody(expectedBody))
+
+        val request = Request.Builder()
+            .url(mockWebServer.url("/api/events"))
+            .get()
+            .build()
+
+        val response = client.newCall(request).execute()
+
+        assertEquals(200, response.code)
+        assertEquals(expectedBody, response.body?.string())
+    }
 }
