@@ -3,12 +3,15 @@ package com.proxyman.atlantis
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class AtlantisInterceptorTest {
@@ -298,5 +301,28 @@ class AtlantisInterceptorTest {
 
         assertEquals(200, response.code)
         assertEquals(expectedBody, response.body?.string())
+    }
+
+    @Test
+    fun `test interceptor does not block websocket messages`() {
+        mockWebServer.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
+                webSocket.send("first")
+            }
+        }))
+
+        val firstMessage = CountDownLatch(1)
+        val request = Request.Builder()
+            .url(mockWebServer.url("/ws"))
+            .build()
+
+        val webSocket = client.newWebSocket(request, Atlantis.wrapWebSocketListener(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                if (text == "first") firstMessage.countDown()
+            }
+        }))
+
+        assertTrue("First message was not delivered while the socket is open", firstMessage.await(1, TimeUnit.SECONDS))
+        webSocket.close(1000, null)
     }
 }
