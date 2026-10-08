@@ -325,4 +325,30 @@ class AtlantisInterceptorTest {
         assertTrue("First message was not delivered while the socket is open", firstMessage.await(1, TimeUnit.SECONDS))
         webSocket.close(1000, null)
     }
+
+    @Test
+    fun `test capturing body emits each server-sent event as it is read`() {
+        val events = mutableListOf<String>()
+        var completedBody: String? = null
+        val upstream = okio.Buffer()
+        val body = AtlantisInterceptor.CapturingResponseBody(
+            delegate = object : okhttp3.ResponseBody() {
+                override fun contentType() = null
+                override fun contentLength() = -1L
+                override fun source() = upstream
+            },
+            onEvent = { events.add(it) },
+            onComplete = { completedBody = it.toString(Charsets.UTF_8) }
+        )
+        val source = body.source()
+
+        upstream.writeUtf8("data: one\n\nda")
+        source.readUtf8Line()
+        assertEquals(listOf("data: one"), events)
+
+        upstream.writeUtf8("ta: two\r\n\r\n")
+        source.readUtf8()
+        assertEquals(listOf("data: one", "data: two"), events)
+        assertEquals("data: one\n\ndata: two\r\n\r\n", completedBody)
+    }
 }

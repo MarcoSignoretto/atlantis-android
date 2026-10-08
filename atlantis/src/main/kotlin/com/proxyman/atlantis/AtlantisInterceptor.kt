@@ -9,6 +9,7 @@ import okhttp3.ResponseBody
 import okio.Buffer
 import okio.BufferedSink
 import okio.BufferedSource
+import okio.ByteString.Companion.encodeUtf8
 import okio.ForwardingSource
 import okio.GzipSource
 import okio.buffer
@@ -37,6 +38,7 @@ class AtlantisInterceptor internal constructor() : Interceptor {
     companion object {
         private const val TAG = "AtlantisInterceptor"
         private const val MAX_BODY_SIZE = 52428800L // 50MB
+        private const val NORMAL_CLOSURE_CODE = 1000
         private val UTF8 = Charset.forName("UTF-8")
     }
     
@@ -90,25 +92,44 @@ class AtlantisInterceptor internal constructor() : Interceptor {
 
         // Streaming responses (e.g. Server-Sent Events) never end, so buffering the
         // body here would block the caller until the stream closes. Instead, capture
-        // the bytes as the caller reads them and send the package when the stream ends.
+        // the bytes as the caller reads them:
+        // - each event is forwarded live as a message of a WebSocket-style flow
+        // - the complete HTTP flow is sent once the stream ends
         val responseBody = response.body
         if (responseBody != null && isStreamingBody(responseBody)) {
             return try {
-                val capturingBody = CapturingResponseBody(responseBody) { data ->
-                    try {
-                        val trafficPackage = TrafficPackage(
-                            id = requestId,
-                            startAt = startTime,
-                            request = captureRequestMetadata(originalRequest, capturedRequestBody),
-                            response = captureResponseMetadata(response),
-                            responseBodyData = if (data.isNotEmpty()) Base64Utils.encode(data) else "",
-                            endAt = System.currentTimeMillis() / 1000.0
-                        )
-                        Atlantis.sendPackage(trafficPackage)
-                    } catch (captureError: Exception) {
-                        // Silently ignore capture errors - never affect the app
-                    }
+                val streamId = UUID.randomUUID().toString()
+                try {
+                    Atlantis.onWebSocketOpen(id = streamId, request = originalRequest, response = response)
+                } catch (captureError: Exception) {
+                    // Silently ignore capture errors - never affect the app
                 }
+                val capturingBody = CapturingResponseBody(
+                    delegate = responseBody,
+                    onEvent = { event ->
+                        try {
+                            Atlantis.onWebSocketReceiveText(id = streamId, text = event)
+                        } catch (captureError: Exception) {
+                            // Silently ignore capture errors - never affect the app
+                        }
+                    },
+                    onComplete = { data ->
+                        try {
+                            Atlantis.onWebSocketClosing(id = streamId, code = NORMAL_CLOSURE_CODE, reason = null)
+                            val trafficPackage = TrafficPackage(
+                                id = requestId,
+                                startAt = startTime,
+                                request = captureRequestMetadata(originalRequest, capturedRequestBody),
+                                response = captureResponseMetadata(response),
+                                responseBodyData = if (data.isNotEmpty()) Base64Utils.encode(data) else "",
+                                endAt = System.currentTimeMillis() / 1000.0
+                            )
+                            Atlantis.sendPackage(trafficPackage)
+                        } catch (captureError: Exception) {
+                            // Silently ignore capture errors - never affect the app
+                        }
+                    }
+                )
                 response.newBuilder().body(capturingBody).build()
             } catch (captureError: Exception) {
                 response
@@ -327,16 +348,19 @@ class AtlantisInterceptor internal constructor() : Interceptor {
 
     /**
      * A ResponseBody wrapper that copies the body data as the caller reads it
+     * [onEvent] is invoked for every complete Server-Sent Event (terminated by a blank line)
      * [onComplete] is invoked once, when the stream is exhausted or closed
      */
-    private class CapturingResponseBody(
+    internal class CapturingResponseBody(
         private val delegate: ResponseBody,
+        private val onEvent: (String) -> Unit,
         private val onComplete: (ByteArray) -> Unit
     ) : ResponseBody() {
-
+        
         private val captured = Buffer()
+        private val pendingEvent = Buffer()
         private val completed = AtomicBoolean(false)
-
+        
         private val source: BufferedSource by lazy {
             object : ForwardingSource(delegate.source()) {
                 override fun read(sink: Buffer, byteCount: Long): Long {
@@ -348,23 +372,46 @@ class AtlantisInterceptor internal constructor() : Interceptor {
                         if (bytesToCopy > 0) {
                             sink.copyTo(captured, sink.size - bytesRead, bytesToCopy)
                         }
+                        sink.copyTo(pendingEvent, sink.size - bytesRead, bytesRead)
+                        emitCompleteEvents()
                     }
                     return bytesRead
                 }
-
+                
                 override fun close() {
                     complete()
                     super.close()
                 }
             }.buffer()
         }
-
+        
         override fun contentType(): MediaType? = delegate.contentType()
-
+        
         override fun contentLength(): Long = delegate.contentLength()
-
+        
         override fun source(): BufferedSource = source
-
+        
+        private fun emitCompleteEvents() {
+            while (true) {
+                val lf = pendingEvent.indexOf(LF_EVENT_END)
+                val crlf = pendingEvent.indexOf(CRLF_EVENT_END)
+                val (index, length) = when {
+                    lf == -1L && crlf == -1L -> break
+                    crlf == -1L || (lf != -1L && lf < crlf) -> lf to LF_EVENT_END.size.toLong()
+                    else -> crlf to CRLF_EVENT_END.size.toLong()
+                }
+                val event = pendingEvent.readUtf8(index)
+                pendingEvent.skip(length)
+                if (event.isNotBlank()) {
+                    try {
+                        onEvent(event)
+                    } catch (e: Exception) {
+                        // Silently ignore capture callback errors
+                    }
+                }
+            }
+        }
+        
         private fun complete() {
             if (!completed.compareAndSet(false, true)) {
                 return
@@ -374,6 +421,11 @@ class AtlantisInterceptor internal constructor() : Interceptor {
             } catch (e: Exception) {
                 // Silently ignore capture callback errors
             }
+        }
+        
+        private companion object {
+            val LF_EVENT_END = "\n\n".encodeUtf8()
+            val CRLF_EVENT_END = "\r\n\r\n".encodeUtf8()
         }
     }
 }
