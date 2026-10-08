@@ -3,12 +3,15 @@ package com.proxyman.atlantis
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class AtlantisInterceptorTest {
@@ -255,5 +258,97 @@ class AtlantisInterceptorTest {
         
         threads.forEach { it.start() }
         threads.forEach { it.join() }
+    }
+
+    @Test
+    fun `test interceptor does not buffer server-sent events stream`() {
+        val event = "data: tick\n\n"
+        mockWebServer.enqueue(MockResponse()
+            .setResponseCode(200)
+            .addHeader("Content-Type", "text/event-stream")
+            .setBody(event.repeat(3))
+            .throttleBody(event.length.toLong(), 1, TimeUnit.SECONDS))
+
+        val request = Request.Builder()
+            .url(mockWebServer.url("/api/events"))
+            .get()
+            .build()
+
+        val start = System.nanoTime()
+        val response = client.newCall(request).execute()
+        val firstLine = response.body!!.source().readUtf8Line()
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
+
+        assertEquals("data: tick", firstLine)
+        assertTrue("First event took ${elapsedMs}ms, stream was buffered", elapsedMs < 1000)
+        response.close()
+    }
+
+    @Test
+    fun `test interceptor preserves server-sent events body for consumer`() {
+        val expectedBody = "data: one\n\ndata: two\n\n"
+        mockWebServer.enqueue(MockResponse()
+            .setResponseCode(200)
+            .addHeader("Content-Type", "text/event-stream; charset=utf-8")
+            .setBody(expectedBody))
+
+        val request = Request.Builder()
+            .url(mockWebServer.url("/api/events"))
+            .get()
+            .build()
+
+        val response = client.newCall(request).execute()
+
+        assertEquals(200, response.code)
+        assertEquals(expectedBody, response.body?.string())
+    }
+
+    @Test
+    fun `test interceptor does not block websocket messages`() {
+        mockWebServer.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
+                webSocket.send("first")
+            }
+        }))
+
+        val firstMessage = CountDownLatch(1)
+        val request = Request.Builder()
+            .url(mockWebServer.url("/ws"))
+            .build()
+
+        val webSocket = client.newWebSocket(request, Atlantis.wrapWebSocketListener(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                if (text == "first") firstMessage.countDown()
+            }
+        }))
+
+        assertTrue("First message was not delivered while the socket is open", firstMessage.await(1, TimeUnit.SECONDS))
+        webSocket.close(1000, null)
+    }
+
+    @Test
+    fun `test capturing body emits each server-sent event as it is read`() {
+        val events = mutableListOf<String>()
+        var completedBody: String? = null
+        val upstream = okio.Buffer()
+        val body = AtlantisInterceptor.CapturingResponseBody(
+            delegate = object : okhttp3.ResponseBody() {
+                override fun contentType() = null
+                override fun contentLength() = -1L
+                override fun source() = upstream
+            },
+            onEvent = { events.add(it) },
+            onComplete = { completedBody = it.toString(Charsets.UTF_8) }
+        )
+        val source = body.source()
+
+        upstream.writeUtf8("data: one\n\nda")
+        source.readUtf8Line()
+        assertEquals(listOf("data: one"), events)
+
+        upstream.writeUtf8("ta: two\r\n\r\n")
+        source.readUtf8()
+        assertEquals(listOf("data: one", "data: two"), events)
+        assertEquals("data: one\n\ndata: two\r\n\r\n", completedBody)
     }
 }
