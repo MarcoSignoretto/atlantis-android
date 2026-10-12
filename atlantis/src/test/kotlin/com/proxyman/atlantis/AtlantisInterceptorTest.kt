@@ -350,6 +350,38 @@ class AtlantisInterceptorTest {
     }
 
     @Test
+    fun `test capturing body emits each server-sent event as it is read`() {
+        val events = mutableListOf<String>()
+        var completedBody: String? = null
+        val upstream = okio.Buffer()
+        val body = capturingBody(upstream, onEvent = { events.add(it) }) { data, _, _ ->
+            completedBody = data.toString(Charsets.UTF_8)
+        }
+        val source = body.source()
+
+        upstream.writeUtf8("data: one\n\nda")
+        source.readUtf8Line()
+        assertEquals(listOf("data: one"), events)
+
+        upstream.writeUtf8("ta: two\r\n\r\n")
+        source.readUtf8()
+        assertEquals(listOf("data: one", "data: two"), events)
+        assertEquals("data: one\n\ndata: two\r\n\r\n", completedBody)
+    }
+
+    @Test
+    fun `test capturing body accepts every server-sent event line ending`() {
+        val events = mutableListOf<String>()
+        val upstream = okio.Buffer()
+        val body = capturingBody(upstream, onEvent = { events.add(it) }) { _, _, _ -> }
+
+        upstream.writeUtf8("data: a\r\rid: 1\ndata: b\r\n\ndata: c\n\r\n")
+        body.source().readUtf8()
+
+        assertEquals(listOf("data: a", "id: 1\ndata: b", "data: c"), events)
+    }
+
+    @Test
     fun `test capturing body marks bodies larger than the limit as truncated`() {
         var truncated: Boolean? = null
         var captured: ByteArray? = null
@@ -359,6 +391,7 @@ class AtlantisInterceptorTest {
                 override fun contentLength() = 100L * 1024 * 1024
                 override fun source() = okio.Buffer().writeUtf8("data")
             },
+            onEvent = null,
             onComplete = { data, isTruncated, _ ->
                 captured = data
                 truncated = isTruncated
@@ -402,19 +435,50 @@ class AtlantisInterceptorTest {
     }
 
     @Test
-    fun `test recorder receives failed response body as an error`() {
+    fun `test recorder receives server-sent events as a stream`() {
+        val recorder = FakeRecorder()
+        val body = "data: one\r\rdata: two\n\n"
+        mockWebServer.enqueue(MockResponse()
+            .setResponseCode(200)
+            .addHeader("Content-Type", "text/event-stream")
+            .setBody(body))
+
+        val response = clientWith(recorder).newCall(Request.Builder().url(mockWebServer.url("/api/events")).build()).execute()
+        response.body!!.string()
+
+        assertEquals(listOf("open", "event:data: one", "event:data: two", "close:1000"), recorder.nextStreamMessages(4))
+        assertEquals(body, decode(recorder.nextPackage().responseBodyData))
+    }
+
+    @Test
+    fun `test recorder receives failed server-sent events stream as an error`() {
         val recorder = FakeRecorder()
         mockWebServer.enqueue(MockResponse()
             .setResponseCode(200)
-            .addHeader("Content-Type", "application/json")
-            .setBody("{\"a\":1}".repeat(1000))
+            .addHeader("Content-Type", "text/event-stream")
+            .setBody("data: one\n\n".repeat(1000))
             .setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY))
 
-        val response = clientWith(recorder).newCall(Request.Builder().url(mockWebServer.url("/api/test")).build()).execute()
+        val response = clientWith(recorder).newCall(Request.Builder().url(mockWebServer.url("/api/events")).build()).execute()
         assertThrows(java.io.IOException::class.java) { response.body!!.source().readUtf8() }
 
+        assertEquals("close:1006", recorder.nextStreamMessages(Int.MAX_VALUE).last())
         assertNotNull(recorder.nextPackage().error)
     }
+
+    private fun capturingBody(
+        upstream: okio.Buffer,
+        onEvent: ((String) -> Unit)?,
+        onComplete: (ByteArray, Boolean, java.io.IOException?) -> Unit
+    ) = AtlantisInterceptor.CapturingResponseBody(
+        delegate = object : okhttp3.ResponseBody() {
+            override fun contentType() = null
+            override fun contentLength() = -1L
+            override fun source() = upstream
+        },
+        onEvent = onEvent,
+        onComplete = onComplete
+    )
 
     private fun clientWith(recorder: TrafficRecorder) = OkHttpClient.Builder()
         .addInterceptor(AtlantisInterceptor(recorder))
@@ -425,11 +489,33 @@ class AtlantisInterceptorTest {
 
     private class FakeRecorder : TrafficRecorder {
         private val packages = LinkedBlockingQueue<TrafficPackage>()
+        private val streamMessages = LinkedBlockingQueue<String>()
 
         fun nextPackage(): TrafficPackage = packages.poll(5, TimeUnit.SECONDS) ?: error("No package recorded")
 
+        fun nextStreamMessages(count: Int): List<String> {
+            val messages = mutableListOf<String>()
+            while (messages.size < count) {
+                val message = streamMessages.poll(1, TimeUnit.SECONDS) ?: break
+                messages.add(message)
+            }
+            return messages
+        }
+
         override fun sendPackage(trafficPackage: TrafficPackage) {
             packages.add(trafficPackage)
+        }
+
+        override fun onStreamOpen(id: String, request: okhttp3.Request, response: okhttp3.Response) {
+            streamMessages.add("open")
+        }
+
+        override fun onStreamEvent(id: String, text: String) {
+            streamMessages.add("event:$text")
+        }
+
+        override fun onStreamClose(id: String, code: Int, reason: String?) {
+            streamMessages.add("close:$code")
         }
     }
 }
