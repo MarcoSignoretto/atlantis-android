@@ -15,6 +15,7 @@ import okio.buffer
 import java.io.IOException
 import java.nio.charset.Charset
 import java.util.UUID
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
@@ -39,11 +40,18 @@ class AtlantisInterceptor internal constructor(
     companion object {
         private const val TAG = "AtlantisInterceptor"
         private const val MAX_BODY_SIZE = 52428800L // 50MB
+        private const val MAX_EVENT_SIZE = 1048576L // 1MB
+        private const val NORMAL_CLOSURE_CODE = 1000
+        private const val ABNORMAL_CLOSURE_CODE = 1006
         private val UTF8 = Charset.forName("UTF-8")
         private val BODY_TOO_LARGE = "<Body too large>".toByteArray()
-        private val captureExecutor = Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "Atlantis-Capture").apply { isDaemon = true }
-        }
+        private val captureExecutor = captureThread("Atlantis-Capture")
+        private val streamExecutor = captureThread("Atlantis-Stream")
+
+        private fun captureThread(name: String): ExecutorService =
+            Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, name).apply { isDaemon = true }
+            }
     }
     
     @Throws(IOException::class)
@@ -72,7 +80,7 @@ class AtlantisInterceptor internal constructor(
         } catch (e: IOException) {
             // Request failed, but we still want to log it
             val endAt = System.currentTimeMillis() / 1000.0
-            capture {
+            capture(captureExecutor) {
                 val trafficPackage = TrafficPackage(
                     id = requestId,
                     startAt = startTime,
@@ -95,16 +103,31 @@ class AtlantisInterceptor internal constructor(
         // Never read the body here: buffering it would delay the caller until the whole
         // response is downloaded (forever for Server-Sent Events). Instead, copy the bytes
         // as the caller reads them and send the flow from a background thread once the
-        // body is exhausted, closed or fails.
+        // body is exhausted, closed or fails. Server-Sent Events are also forwarded live
+        // as messages of a WebSocket-style flow.
         val responseBody = response.body ?: return response
         return try {
             if (hasNoBody(originalRequest, response, responseBody)) {
                 sendTrafficPackage(requestId, startTime, originalRequest, capturedRequestBody, response)
                 return response
             }
-            val capturingBody = CapturingResponseBody(responseBody) { data, truncated, error ->
-                sendTrafficPackage(requestId, startTime, originalRequest, capturedRequestBody, response, data, truncated, error)
+            val streamId = if (isStreamingBody(responseBody)) UUID.randomUUID().toString() else null
+            if (streamId != null) {
+                capture(streamExecutor) { recorder.onStreamOpen(streamId, originalRequest, response) }
             }
+            val capturingBody = CapturingResponseBody(
+                delegate = responseBody,
+                onEvent = streamId?.let { id ->
+                    { event: String -> capture(streamExecutor) { recorder.onStreamEvent(id, event) } }
+                },
+                onComplete = { data, truncated, error ->
+                    if (streamId != null) {
+                        val code = if (error == null) NORMAL_CLOSURE_CODE else ABNORMAL_CLOSURE_CODE
+                        capture(streamExecutor) { recorder.onStreamClose(streamId, code, error?.message) }
+                    }
+                    sendTrafficPackage(requestId, startTime, originalRequest, capturedRequestBody, response, data, truncated, error)
+                }
+            )
             response.newBuilder().body(capturingBody).build()
         } catch (captureError: Exception) {
             response
@@ -122,7 +145,7 @@ class AtlantisInterceptor internal constructor(
         error: IOException? = null
     ) {
         val endAt = System.currentTimeMillis() / 1000.0
-        capture {
+        capture(captureExecutor) {
             val (atlantisResponse, responseBodyData) = captureResponse(response, data, truncated)
             val trafficPackage = TrafficPackage(
                 id = requestId,
@@ -140,8 +163,8 @@ class AtlantisInterceptor internal constructor(
     /**
      * Run capture work off the caller's thread, in order, ignoring any failure
      */
-    private fun capture(block: () -> Unit) {
-        captureExecutor.execute {
+    private fun capture(executor: ExecutorService, block: () -> Unit) {
+        executor.execute {
             try {
                 block()
             } catch (captureError: Exception) {
@@ -241,6 +264,14 @@ class AtlantisInterceptor internal constructor(
     }
 
     /**
+     * Check if the response body is an open-ended stream that must not be buffered upfront
+     */
+    private fun isStreamingBody(body: ResponseBody): Boolean {
+        val contentType = body.contentType() ?: return false
+        return contentType.type == "text" && contentType.subtype == "event-stream"
+    }
+
+    /**
      * A RequestBody wrapper that captures the body data as it's being written
      * This is non-destructive - the original body is written to the network normally
      */
@@ -279,10 +310,12 @@ class AtlantisInterceptor internal constructor(
 
     /**
      * A ResponseBody wrapper that copies the body data as the caller reads it
+     * [onEvent] is invoked for every complete Server-Sent Event (terminated by a blank line)
      * [onComplete] is invoked once, when the stream is exhausted, closed or fails
      */
     internal class CapturingResponseBody(
         private val delegate: ResponseBody,
+        private val onEvent: ((String) -> Unit)?,
         private val onComplete: (data: ByteArray, truncated: Boolean, error: IOException?) -> Unit
     ) : ResponseBody() {
         
@@ -290,6 +323,9 @@ class AtlantisInterceptor internal constructor(
         private val captured = Buffer()
         private var truncated = delegate.contentLength() > MAX_BODY_SIZE
         private var error: IOException? = null
+        private val event = Buffer()
+        private var lineHasContent = false
+        private var lastWasCR = false
         private var completed = false
         
         private val source: BufferedSource by lazy {
@@ -335,9 +371,59 @@ class AtlantisInterceptor internal constructor(
                             sink.copyTo(captured, offset, byteCount)
                         }
                     }
+                    val onEvent = onEvent ?: return
+                    val chunk = Buffer()
+                    sink.copyTo(chunk, offset, byteCount)
+                    parseEvents(chunk, onEvent)
                 }
             } catch (e: Exception) {
                 // Silently ignore capture errors - never affect the app
+            }
+        }
+        
+        /**
+         * Split Server-Sent Events on blank lines, accepting CR, LF and CRLF line endings
+         */
+        private fun parseEvents(chunk: Buffer, onEvent: (String) -> Unit) {
+            while (!chunk.exhausted()) {
+                when (val byte = chunk.readByte()) {
+                    CR -> {
+                        endLine(onEvent)
+                        lastWasCR = true
+                    }
+                    LF -> {
+                        if (lastWasCR) {
+                            lastWasCR = false
+                        } else {
+                            endLine(onEvent)
+                        }
+                    }
+                    else -> {
+                        lastWasCR = false
+                        lineHasContent = true
+                        if (event.size < MAX_EVENT_SIZE) {
+                            event.writeByte(byte.toInt())
+                        }
+                    }
+                }
+            }
+        }
+        
+        private fun endLine(onEvent: (String) -> Unit) {
+            if (lineHasContent) {
+                lineHasContent = false
+                if (event.size < MAX_EVENT_SIZE) {
+                    event.writeByte(LF.toInt())
+                }
+                return
+            }
+            val text = event.readUtf8().trimEnd('\n')
+            if (text.isNotBlank()) {
+                try {
+                    onEvent(text)
+                } catch (e: Exception) {
+                    // Silently ignore capture callback errors
+                }
             }
         }
         
@@ -352,6 +438,11 @@ class AtlantisInterceptor internal constructor(
             } catch (e: Exception) {
                 // Silently ignore capture callback errors
             }
+        }
+        
+        private companion object {
+            const val CR = '\r'.code.toByte()
+            const val LF = '\n'.code.toByte()
         }
     }
 }
